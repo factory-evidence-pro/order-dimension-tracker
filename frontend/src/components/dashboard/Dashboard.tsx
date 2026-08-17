@@ -6,11 +6,13 @@ import {
     IconButton, CircularProgress, Table, TableBody, TableCell,
     TableContainer, TableHead, TableRow, TablePagination,
     Card, CardContent, Dialog, DialogTitle, DialogContent,
-    DialogActions, Tooltip, InputAdornment, Alert, Divider
+    DialogActions, Tooltip, InputAdornment, Alert, Divider,
+    Badge
 } from '@mui/material';
 import {
     Refresh, Download, Search, Save, QrCodeScanner,
-    CheckCircle, Pending, FilterList
+    CheckCircle, Pending, FilterList, Warning, History,
+    ContentCopy, Cancel
 } from '@mui/icons-material';
 import { DatePicker } from '@mui/x-date-pickers';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
@@ -18,13 +20,23 @@ import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { useAuth } from '../../hooks/useAuth';
 import { orderApi } from '../../services/api';
 
-const StatCard = ({ title, value, icon, color }: any) => (
+const StatCard = ({ title, value, icon, color, badge }: any) => (
     <Card>
         <CardContent>
             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <Box>
                     <Typography color="textSecondary" variant="caption">{title}</Typography>
-                    <Typography variant="h4" sx={{ mt: 1 }}>{value}</Typography>
+                    <Typography variant="h4" sx={{ mt: 1 }}>
+                        {value}
+                        {badge && (
+                            <Chip 
+                                size="small" 
+                                label={badge} 
+                                color="warning" 
+                                sx={{ ml: 1, fontSize: '0.7rem' }}
+                            />
+                        )}
+                    </Typography>
                 </Box>
                 <Box sx={{ p: 1, borderRadius: 2, bgcolor: `${color}20`, color }}>
                     {icon}
@@ -47,6 +59,8 @@ export const Dashboard: React.FC = () => {
     const [dimensions, setDimensions] = useState({ l: '', w: '', h: '' });
     const [selectedOrder, setSelectedOrder] = useState<any>(null);
     const [exportDialogOpen, setExportDialogOpen] = useState(false);
+    const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false);
+    const [isSubmitting, setIsSubmitting] = useState(false);
 
     // Fetch orders
     const { data, isLoading, refetch } = useQuery({
@@ -67,27 +81,42 @@ export const Dashboard: React.FC = () => {
         keepPreviousData: true,
     });
 
-    // Lookup order
+    // ✅ Lookup order with duplicate detection
     const lookupOrder = useCallback(async (tracking: string) => {
+        if (!tracking) {
+            toast.warning('Please enter a tracking number');
+            return;
+        }
+
         try {
             const response = await orderApi.getOrderByTracking(tracking);
             const order = response.data.data;
-            setSelectedOrder(order);
-
+            
+            // ✅ Check if dimensions already exist
             if (order.dimensions) {
+                setSelectedOrder(order);
+                toast.info(
+                    `Order already has dimensions: ${order.dimensions}. You can update or force overwrite.`
+                );
+                // Pre-fill dimensions
                 const dims = order.dimensions.split('×').map((d: string) => d.trim());
                 if (dims.length === 3) {
                     setDimensions({ l: dims[0], w: dims[1], h: dims[2] });
                 }
+                return;
             }
-            toast.success('Order found');
+            
+            setSelectedOrder(order);
+            toast.success('Order found - please enter dimensions');
         } catch (error: any) {
             if (error.response?.status === 404) {
+                // ✅ Check if exists in BigSeller
                 const check = await orderApi.checkOrder(tracking);
-                if (check.data.exists) {
+                if (check.data.existsInBigSeller) {
                     toast.info('Order exists in BigSeller but not scanned yet');
+                    setSelectedOrder({ tracking_number: tracking, source: 'bigseller' });
                 } else {
-                    toast.error('Order not found in BigSeller data');
+                    toast.error('Order not found in BigSeller data. Please sync first.');
                 }
             } else {
                 toast.error('Error looking up order');
@@ -96,17 +125,51 @@ export const Dashboard: React.FC = () => {
         }
     }, []);
 
-    // Save dimensions
+    // ✅ Save dimensions with duplicate handling
     const saveMutation = useMutation({
-        mutationFn: orderApi.saveDimensions,
+        mutationFn: async (data: any) => {
+            const response = await orderApi.saveDimensions(data);
+            return response.data;
+        },
         onSuccess: () => {
             toast.success('Dimensions saved successfully');
             queryClient.invalidateQueries({ queryKey: ['orders'] });
             setSelectedOrder(null);
             setDimensions({ l: '', w: '', h: '' });
+            setIsSubmitting(false);
         },
         onError: (error: any) => {
-            toast.error(error.response?.data?.error || 'Failed to save dimensions');
+            setIsSubmitting(false);
+            const errorData = error.response?.data;
+            
+            // ✅ Handle duplicate scan error
+            if (errorData?.errorCode === 'DUPLICATE_SCAN') {
+                setDuplicateDialogOpen(true);
+                toast.warning('Duplicate scan detected!');
+                return;
+            }
+            
+            toast.error(errorData?.error || 'Failed to save dimensions');
+        }
+    });
+
+    // ✅ Force overwrite mutation
+    const forceOverwriteMutation = useMutation({
+        mutationFn: async (data: any) => {
+            const response = await orderApi.forceOverwrite(data);
+            return response.data;
+        },
+        onSuccess: () => {
+            toast.success('Dimensions force updated successfully');
+            queryClient.invalidateQueries({ queryKey: ['orders'] });
+            setSelectedOrder(null);
+            setDimensions({ l: '', w: '', h: '' });
+            setDuplicateDialogOpen(false);
+            setIsSubmitting(false);
+        },
+        onError: (error: any) => {
+            setIsSubmitting(false);
+            toast.error(error.response?.data?.error || 'Failed to force overwrite');
         }
     });
 
@@ -134,7 +197,19 @@ export const Dashboard: React.FC = () => {
             return;
         }
 
+        setIsSubmitting(true);
         saveMutation.mutate({
+            trackingNumber: selectedOrder.tracking_number,
+            orderNumber: selectedOrder.order_number,
+            dimensions: `${l} × ${w} × ${h}`,
+            skus: selectedOrder.skus,
+            quantity: selectedOrder.quantity,
+        });
+    };
+
+    const handleForceOverwrite = () => {
+        const { l, w, h } = dimensions;
+        forceOverwriteMutation.mutate({
             trackingNumber: selectedOrder.tracking_number,
             orderNumber: selectedOrder.order_number,
             dimensions: `${l} × ${w} × ${h}`,
@@ -148,8 +223,9 @@ export const Dashboard: React.FC = () => {
         acc.total++;
         if (order.status === 'SAVED') acc.saved++;
         if (order.status === 'PENDING') acc.pending++;
+        if (order.duplicate_scan_count > 0) acc.duplicates++;
         return acc;
-    }, { total: 0, saved: 0, pending: 0 }) || { total: 0, saved: 0, pending: 0 };
+    }, { total: 0, saved: 0, pending: 0, duplicates: 0 }) || { total: 0, saved: 0, pending: 0, duplicates: 0 };
 
     return (
         <LocalizationProvider dateAdapter={AdapterDateFns}>
@@ -181,16 +257,25 @@ export const Dashboard: React.FC = () => {
                     </Box>
                 </Box>
 
-                {/* Stats */}
+                {/* Stats with Duplicate Indicator */}
                 <Grid container spacing={3} sx={{ mb: 3 }}>
-                    <Grid item xs={12} sm={4}>
+                    <Grid item xs={12} sm={3}>
                         <StatCard title="Total Orders" value={stats.total} icon={<FilterList />} color="#2563eb" />
                     </Grid>
-                    <Grid item xs={12} sm={4}>
+                    <Grid item xs={12} sm={3}>
                         <StatCard title="Dimensions Saved" value={stats.saved} icon={<CheckCircle />} color="#22c55e" />
                     </Grid>
-                    <Grid item xs={12} sm={4}>
+                    <Grid item xs={12} sm={3}>
                         <StatCard title="Pending" value={stats.pending} icon={<Pending />} color="#eab308" />
+                    </Grid>
+                    <Grid item xs={12} sm={3}>
+                        <StatCard 
+                            title="Duplicates" 
+                            value={stats.duplicates} 
+                            icon={<Warning />} 
+                            color="#ef4444"
+                            badge="⚠️ Needs Review"
+                        />
                     </Grid>
                 </Grid>
 
@@ -204,7 +289,7 @@ export const Dashboard: React.FC = () => {
                                 Scan Order
                             </Typography>
                             <Divider sx={{ my: 2 }} />
-
+                            
                             <TextField
                                 fullWidth
                                 label="Tracking Number"
@@ -228,17 +313,44 @@ export const Dashboard: React.FC = () => {
                                 <Box sx={{ p: 2, bgcolor: 'action.hover', borderRadius: 1, mb: 2 }}>
                                     <Typography variant="caption" color="textSecondary">Order Details</Typography>
                                     <Box sx={{ mt: 1 }}>
-                                        <Typography variant="body2"><strong>Order #:</strong> {selectedOrder.order_number || '-'}</Typography>
-                                        <Typography variant="body2"><strong>Tracking:</strong> {selectedOrder.tracking_number}</Typography>
-                                        <Typography variant="body2"><strong>SKUs:</strong> {selectedOrder.skus || '-'}</Typography>
-                                        <Typography variant="body2"><strong>Qty:</strong> {selectedOrder.quantity || 0}</Typography>
-                                        <Box sx={{ mt: 1 }}>
-                                            <Chip
-                                                label={selectedOrder.status}
-                                                size="small"
-                                                color={selectedOrder.status === 'SAVED' ? 'success' : 'warning'}
+                                        <Typography variant="body2">
+                                            <strong>Tracking:</strong> {selectedOrder.tracking_number}
+                                        </Typography>
+                                        {selectedOrder.order_number && (
+                                            <Typography variant="body2">
+                                                <strong>Order #:</strong> {selectedOrder.order_number}
+                                            </Typography>
+                                        )}
+                                        {selectedOrder.skus && (
+                                            <Typography variant="body2">
+                                                <strong>SKUs:</strong> {selectedOrder.skus}
+                                            </Typography>
+                                        )}
+                                        {selectedOrder.quantity && (
+                                            <Typography variant="body2">
+                                                <strong>Qty:</strong> {selectedOrder.quantity}
+                                            </Typography>
+                                        )}
+                                        {selectedOrder.dimensions && (
+                                            <Box sx={{ mt: 1, p: 1, bgcolor: '#fef9e7', borderRadius: 1 }}>
+                                                <Typography variant="body2" color="warning.main">
+                                                    ⚠️ Existing Dimensions: {selectedOrder.dimensions}
+                                                </Typography>
+                                                {selectedOrder.duplicate_scan_count > 0 && (
+                                                    <Typography variant="caption" color="error">
+                                                        This order has been scanned {selectedOrder.duplicate_scan_count} time(s)
+                                                    </Typography>
+                                                )}
+                                            </Box>
+                                        )}
+                                        {selectedOrder.version_count > 1 && (
+                                            <Chip 
+                                                size="small" 
+                                                label={`${selectedOrder.version_count} versions`}
+                                                icon={<History />}
+                                                sx={{ mt: 1 }}
                                             />
-                                        </Box>
+                                        )}
                                     </Box>
                                 </Box>
                             )}
@@ -278,15 +390,45 @@ export const Dashboard: React.FC = () => {
                                 />
                             </Box>
 
-                            <Button
-                                fullWidth
-                                variant="contained"
-                                startIcon={saveMutation.isLoading ? <CircularProgress size={20} /> : <Save />}
-                                onClick={handleSave}
-                                disabled={!selectedOrder || !dimensions.l || !dimensions.w || !dimensions.h || saveMutation.isLoading}
-                            >
-                                {saveMutation.isLoading ? 'Saving...' : 'Save Dimensions'}
-                            </Button>
+                            {selectedOrder?.dimensions ? (
+                                <>
+                                    <Button
+                                        fullWidth
+                                        variant="contained"
+                                        color="warning"
+                                        startIcon={isSubmitting ? <CircularProgress size={20} /> : <Warning />}
+                                        onClick={handleSave}
+                                        disabled={isSubmitting || !dimensions.l || !dimensions.w || !dimensions.h}
+                                        sx={{ mb: 1 }}
+                                    >
+                                        {isSubmitting ? 'Saving...' : 'Update Dimensions'}
+                                    </Button>
+                                    <Button
+                                        fullWidth
+                                        variant="outlined"
+                                        color="error"
+                                        startIcon={<ContentCopy />}
+                                        onClick={() => {
+                                            if (window.confirm('This will overwrite existing dimensions. Continue?')) {
+                                                handleForceOverwrite();
+                                            }
+                                        }}
+                                        disabled={isSubmitting || !dimensions.l || !dimensions.w || !dimensions.h}
+                                    >
+                                        Force Overwrite
+                                    </Button>
+                                </>
+                            ) : (
+                                <Button
+                                    fullWidth
+                                    variant="contained"
+                                    startIcon={isSubmitting ? <CircularProgress size={20} /> : <Save />}
+                                    onClick={handleSave}
+                                    disabled={!selectedOrder || !dimensions.l || !dimensions.w || !dimensions.h || isSubmitting}
+                                >
+                                    {isSubmitting ? 'Saving...' : 'Save Dimensions'}
+                                </Button>
+                            )}
                         </Paper>
                     </Grid>
 
@@ -351,19 +493,23 @@ export const Dashboard: React.FC = () => {
                                                     <TableCell align="center">Qty</TableCell>
                                                     <TableCell>Dimensions</TableCell>
                                                     <TableCell>Status</TableCell>
+                                                    <TableCell>Duplicates</TableCell>
                                                     <TableCell>Date</TableCell>
                                                 </TableRow>
                                             </TableHead>
                                             <TableBody>
                                                 {data?.data?.map((order: any) => (
-                                                    <TableRow
+                                                    <TableRow 
                                                         key={order.id}
                                                         hover
                                                         onClick={() => {
                                                             setTrackingNumber(order.tracking_number);
                                                             lookupOrder(order.tracking_number);
                                                         }}
-                                                        sx={{ cursor: 'pointer' }}
+                                                        sx={{ 
+                                                            cursor: 'pointer',
+                                                            bgcolor: order.duplicate_scan_count > 0 ? '#fef2f2' : 'inherit'
+                                                        }}
                                                     >
                                                         <TableCell>
                                                             <Typography variant="body2" fontWeight="medium">
@@ -372,17 +518,37 @@ export const Dashboard: React.FC = () => {
                                                         </TableCell>
                                                         <TableCell>{order.skus || '-'}</TableCell>
                                                         <TableCell align="center">{order.quantity || 0}</TableCell>
-                                                        <TableCell>{order.dimensions || '-'}</TableCell>
                                                         <TableCell>
-                                                            <Chip
+                                                            {order.dimensions || '-'}
+                                                            {order.version_count > 1 && (
+                                                                <Chip 
+                                                                    size="small" 
+                                                                    label={`v${order.version_count}`}
+                                                                    icon={<History />}
+                                                                    sx={{ ml: 1, fontSize: '0.6rem' }}
+                                                                />
+                                                            )}
+                                                        </TableCell>
+                                                        <TableCell>
+                                                            <Chip 
                                                                 label={order.status}
                                                                 size="small"
                                                                 color={order.status === 'SAVED' ? 'success' : 'warning'}
                                                             />
                                                         </TableCell>
                                                         <TableCell>
-                                                            {order.date_scanned ?
-                                                                new Date(order.date_scanned).toLocaleDateString() :
+                                                            {order.duplicate_scan_count > 0 && (
+                                                                <Chip 
+                                                                    label={`⚠️ ${order.duplicate_scan_count}`}
+                                                                    size="small"
+                                                                    color="error"
+                                                                    icon={<Warning />}
+                                                                />
+                                                            )}
+                                                        </TableCell>
+                                                        <TableCell>
+                                                            {order.date_scanned ? 
+                                                                new Date(order.date_scanned).toLocaleDateString() : 
                                                                 '-'
                                                             }
                                                         </TableCell>
@@ -391,7 +557,7 @@ export const Dashboard: React.FC = () => {
                                             </TableBody>
                                         </Table>
                                     </TableContainer>
-
+                                    
                                     <TablePagination
                                         rowsPerPageOptions={[25, 50, 100]}
                                         component="div"
@@ -410,13 +576,72 @@ export const Dashboard: React.FC = () => {
                     </Grid>
                 </Grid>
 
+                {/* ✅ Duplicate Dialog */}
+                <Dialog open={duplicateDialogOpen} onClose={() => setDuplicateDialogOpen(false)} maxWidth="sm" fullWidth>
+                    <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Warning color="warning" />
+                        Duplicate Scan Detected!
+                    </DialogTitle>
+                    <DialogContent>
+                        <Box sx={{ pt: 2 }}>
+                            <Alert severity="warning" sx={{ mb: 2 }}>
+                                This order already has dimensions saved.
+                            </Alert>
+                            <Typography variant="body2">
+                                <strong>Tracking:</strong> {selectedOrder?.tracking_number}
+                            </Typography>
+                            <Typography variant="body2">
+                                <strong>Existing Dimensions:</strong> {selectedOrder?.dimensions}
+                            </Typography>
+                            <Typography variant="body2">
+                                <strong>New Dimensions:</strong> {dimensions.l} × {dimensions.w} × {dimensions.h}
+                            </Typography>
+                            <Box sx={{ mt: 2, p: 2, bgcolor: '#fef9e7', borderRadius: 1 }}>
+                                <Typography variant="caption" color="warning.main">
+                                    ⚠️ This is a duplicate scan. You can either:
+                                    <br />1. Update with new dimensions
+                                    <br />2. Force overwrite
+                                    <br />3. Cancel to keep existing dimensions
+                                </Typography>
+                            </Box>
+                        </Box>
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setDuplicateDialogOpen(false)} startIcon={<Cancel />}>
+                            Cancel (Keep Existing)
+                        </Button>
+                        <Button 
+                            variant="outlined" 
+                            color="warning"
+                            onClick={() => {
+                                setDuplicateDialogOpen(false);
+                                handleSave();
+                            }}
+                            startIcon={<Save />}
+                        >
+                            Update
+                        </Button>
+                        <Button 
+                            variant="contained" 
+                            color="error"
+                            onClick={() => {
+                                setDuplicateDialogOpen(false);
+                                handleForceOverwrite();
+                            }}
+                            startIcon={<ContentCopy />}
+                        >
+                            Force Overwrite
+                        </Button>
+                    </DialogActions>
+                </Dialog>
+
                 {/* Export Dialog */}
                 <Dialog open={exportDialogOpen} onClose={() => setExportDialogOpen(false)} maxWidth="sm" fullWidth>
                     <DialogTitle>Export Orders</DialogTitle>
                     <DialogContent>
                         <Box sx={{ pt: 2 }}>
                             <Typography variant="body2" color="textSecondary" sx={{ mb: 2 }}>
-                                Export orders as CSV file. Filter by date range.
+                                Export orders as CSV file. Includes duplicate scan information.
                             </Typography>
                             <DatePicker
                                 label="Start Date"
@@ -434,8 +659,8 @@ export const Dashboard: React.FC = () => {
                     </DialogContent>
                     <DialogActions>
                         <Button onClick={() => setExportDialogOpen(false)}>Cancel</Button>
-                        <Button
-                            variant="contained"
+                        <Button 
+                            variant="contained" 
                             onClick={async () => {
                                 try {
                                     const response = await orderApi.exportOrders({
