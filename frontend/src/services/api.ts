@@ -31,23 +31,36 @@ api.interceptors.response.use(
 );
 
 export const orderApi = {
-    getOrders: (params?: any) =>
+    getOrders: (params?: any) => 
         api.get<ApiResponse<Order[]>>('/orders', { params }),
-
+    
     getOrderByTracking: (trackingNumber: string) =>
         api.get<ApiResponse<Order>>(`/orders/${trackingNumber}`),
-
+    
+    // ✅ Updated with duplicate handling
     saveDimensions: (data: any) =>
         api.post<ApiResponse<Order>>('/orders/save', data),
-
+    
+    // ✅ New: Force overwrite
+    forceOverwrite: (data: any) =>
+        api.post<ApiResponse<Order>>('/orders/force-overwrite', data),
+    
     checkOrder: (trackingNumber: string) =>
-        api.get<ApiResponse<{ exists: boolean }>>(`/orders/check/${trackingNumber}`),
-
+        api.get<ApiResponse<{ existsInBigSeller: boolean; existsInDb: boolean }>>(`/orders/check/${trackingNumber}`),
+    
     refreshData: () =>
         api.post<ApiResponse<{ message: string }>>('/refresh'),
-
+    
     exportOrders: (params?: any) =>
         api.get('/export', { ...params, responseType: 'blob' }),
+    
+    // ✅ New: Duplicate report (Admin)
+    getDuplicateReport: () =>
+        api.get('/admin/duplicates'),
+    
+    // ✅ New: Daily stats (Admin)
+    getDailyStats: () =>
+        api.get('/admin/stats/daily'),
 };
 
 export const authApi = {
